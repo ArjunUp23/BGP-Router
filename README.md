@@ -1,34 +1,39 @@
-BGP Router:
+# BGP Router:
 
-Project 3 for CS 4700 - Network Fundamentals at Northeastern University
+## Project 3 for CS 4700 - Network Fundamentals at Northeastern University
 
-This program implements a BGP router to communicate with other routers in a simulation of a peered network topology.
+This program implements a **BGP router** to communicate with other routers in a simulation of a peered network topology.
 The client program communicates using select() to tell which router is talking to us, and then processing that message.
 
-This Program was made with the program specs detailed on 4700.network 
+This Program was made with the program specs detailed on [4700.network](https://4700.network) 
 This Program was tested with the config tests made for this project.
 
 Runs with the command:
-
+```bash
 $ ./4700router <asn> <port-ip.add.re.ss-[peer,prov,cust]> [port-ip.add.re.ss-[peer,prov,cust] ...]
+```
+Can be tested using the command:
+```bash
+$ ./test
+```
 
 And supports the following messages: 
 
-- Handshake Messages
-- Route Update Messages
-- Route Withdraw Messages
-- Data Messages
-- Dump and Table Messages
+1. Handshake Messages
+2. Route Update Messages
+3. Route Withdraw Messages
+4. Data Messages
+5. Dump and Table Messages
 
 
-Table of Contents:
+### Table of Contents:
 
 * High-level overview of the program
 * Challenges faced 
 * Overview of how this program was tested
 
 
-- High-level overview of the program:
+## High-level overview of the program:
 
 This program, at a High-level, works in the following steps:
 
@@ -58,7 +63,7 @@ Dump and Table Messages:
 	+ When our router is sent a 'dump' message it responds with a copy of our forwarding table
 	+ this is used by the project tests to ensure our routing table is correct
 
-- Challenges faced:
+## Challenges faced:
 The main challenge faced for me was the aggregation. Figuring out how to aggregate the table without messing up the routes took
 the longest time out of any aspect of this project. What helped me overcome this challenge was actually using a whiteboard
 and writing out the aggregation steps and helpers needed in pseudocode before coming back to actually typing it out.
@@ -72,7 +77,7 @@ The last challenge I will discuss was cleaning up my program. With large-scale c
 the end result comes out sloppy even if it works. With this project after I finished I spent a long time defining helpers and
 adding comments (if anything, too many) to ensure the readability was there.
 
-- Overview of how this program was tested:
+## Overview of how this program was tested:
 This program was tested mainly through the config files given by the course staff. I followed the implementation guidelines
 in the assignment, and as such went in order of the tests. After each level I used the configs to ensure the correct
 functionality.
