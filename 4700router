@@ -1,0 +1,618 @@
+#!/usr/bin/env -S python3 -u
+
+"""
+Project 3 for CS4700 - Network Fundamentals at Northeastern University
+
+Implements the software for a BGP router to communicate with peered networks supplied by the command line
+
+Program was made and tested with the spec defined by the project description for this course, 
+availible at 4700.network.
+
+Runs with the following command line args:
+./4700router <asn> <port-ip.add.re.ss-[peer,prov,cust]> [port-ip.add.re.ss-[peer,prov,cust]] ...[port-ip.add.re.ss-[peer,prov,cust]]
+
+"""
+
+# imports from the starter code
+import argparse, socket, time, json, select, struct, sys, math
+
+# class that implements the bgp router
+class Router:
+
+    # initialize the global dictionaries needed to store information about neighbors
+    relations = {}
+    sockets = {}
+    ports = {}
+    # Note that the forwarding_table dictionary maps {Network : [list of entries]}
+    forwarding_table = {}
+    # stored updates/withdrawl announcements
+    announcements = []
+    
+    def __init__(self, asn, connections):
+        """
+        init function supplied by starter code - sets up global dictionaries and variables
+        given the command line args
+        """
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            # send handshake msg to initialize the connection to each connection
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    def our_addr(self, dst):
+        """
+        function supplied by starter code, computes the address we use,
+        given the address they use. (turns the last octal 2 -> 1)
+        """
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        """
+        function supplied by starter code, sends a message to the given network, with the given message
+        """
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def run(self):
+        """
+        function supplied by starter code, loops forever using select() to listen for
+        connections trying to talk to us. Then, receives from the socket and decodes the json.
+        Then, finally it passes it off to a helper 'handle_message' that deals with the message from there
+        """
+        while True:
+            # uses select to listen for talking sockets
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                # receives from the socket
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                # decodes and loads the json of the message received
+                msg = k.decode('utf-8')
+                try:
+                    message = json.loads(msg)
+                except json.JSONDecodeError as e:
+                    print("Error decoding JSON:", e)
+                    continue  
+
+                # print msg and pass it off to helper
+                print("Received message '%s' from %s" % (message, srcif))
+                self.handle_message(message, srcif)
+        return
+
+    def handle_message(self, message, srcif):
+        """
+        function that looks at the type of the given (json loaded) message and passes it to the
+        appropriate helper. 
+
+        Takes in the json loaded message and the source interface that sent the message
+        """
+        msg_type = message.get("type")
+
+        # pass the message off to the right helper
+        if msg_type == "update":
+           self.update(message)
+        elif msg_type == "data":
+            self.data(message, srcif)
+        elif msg_type == "dump":
+            self.dumpTable(message)
+        elif msg_type == "withdraw":
+            self.withdraw(message)
+
+    def withdraw(self, message):
+        """
+        function that deals with the withdraw messages. Does so in 4 steps:
+        1. adds message to list of saved announcements
+        2. removes the correct entries from forwarding table
+        3. sends the withdrawal message to neighbors that need to hear it
+        4. rebuild the table (could potentially disaggregates) based on the new information
+
+        takes in the json loaded message
+        """
+        self.announcements.append(message)
+        self.remove_from_table(message)
+        self.send_withdrawl(message, message.get("src"))
+        self.rebuild_table()
+
+    def rebuild_table(self):
+        """
+        Function that rebuilds the forwarding table based on all the saved messages.
+        sets the table to empty, then iterates through each message making the appropriate changes.
+        """
+        # reinitialize table to empty dict
+        self.forwarding_table = {}
+        
+        # interate through saved announcements, adding updates to table and removing withdrawals 
+        for announcement in self.announcements:
+            if announcement.get("type") == "withdraw":
+                self.remove_from_table(announcement)
+            elif announcement.get("type") == "update":
+                self.add_to_forwarding(announcement.get("msg"), announcement.get("src"))
+
+        # aggreagate the new table formed
+        self.aggregate_table()
+        self.remove_empty()
+
+    def remove_empty(self):
+        """
+        removes empty entries from forwarding table, normally called after aggregation
+        """
+        to_remove = []
+        # if length of the entry is 0, meaning no entry; remove it
+        for network, entries in list(self.forwarding_table.items()):
+            if len(entries) == 0:
+                to_remove.append(network)
+
+        # Remove the ips stored in to_remove list
+        for ip in to_remove:
+            self.forwarding_table.pop(ip)
+
+    def send_withdrawl(self, message, srcif):
+        """
+        sends a withdrawal message to neighbors that are the right relationship with me
+
+        takes in the message and the source interface of the person that sent
+        """
+        msg = message.get("msg")
+
+        # if sent from a customer send to all except the person who sent it
+        if self.relations[srcif] == "cust":
+            for neighbor, relation in self.relations.items():
+                if neighbor != srcif:
+                    self.send(neighbor, 
+                            json.dumps({ "msg": msg, "src": self.our_addr(neighbor), "dst": neighbor, "type": "withdraw"}))
+        else:
+            # O.W. only send to customers
+            for neighbor, relation in self.relations.items():
+                if neighbor != srcif and relation == "cust":
+                    self.send(neighbor, 
+                            json.dumps({ "msg": msg, "src": self.our_addr(neighbor), "dst": neighbor, "type": "withdraw"}))
+    
+    def remove_from_table(self, message):
+        """
+        takes in a withdraw message (JSON loaded) and removes the appropriate
+        entries from my forwarding table
+        """
+
+        # gets the list of withdrawls and the neighbor that sent the message
+        withdrawls = message.get("msg")
+        neighbor = message.get("src")
+
+        # for each withdrawal given:
+        # 1. get the network it is shutting down
+        # 2. check if the neighbor that sent the message is the one with the route to the removed neighbor
+        # 3. if so, remove the entry
+        for withdrawl in withdrawls:
+            network = withdrawl.get("network")
+            entries = self.forwarding_table.get(network)
+            new_entry = []
+            if entries:
+                new_entries = [entry for entry in entries if entry['peer'] != neighbor]
+                self.forwarding_table[network] = new_entries
+
+    def dumpTable(self, message):
+        """
+        respond to a dump table message by formatting my forwarding table then sending it
+        to whoever sent the dump message 
+        """
+        src = message.get("src")
+        dst = message.get("dst")
+        msg = []
+        # for each entry in the forwarding table format it and add it to the msg buffer
+        for network, entries in self.forwarding_table.items():
+            for entry in entries:
+                copy = entry.copy()
+                copy["network"] = network
+                msg.append(copy)
+        # send the message with the table to the src that send the message
+        self.send(src, json.dumps({"type": "table", "src": self.our_addr(src), "dst": src, "msg": msg}))
+
+    def update(self, message):
+        """
+        function that deals with the update messages. Does so in 4 steps:
+        1. adds message to list of saved announcements
+        2. adds the correct entries to forwarding table
+        3. sends the update message to neighbors that need to hear it
+        4. rebuild the table (could potentially aggregate) based on the new information
+
+        takes in the json loaded message
+        """
+        self.announcements.append(message)
+        self.add_to_forwarding(message.get("msg"), message.get("src"))
+        self.send_updates(message.get("msg"), message.get("src"))
+        self.aggregate_table()
+        self.remove_empty()
+
+    def aggregate_table(self):
+        """
+        Function that aggregates the forwarding table if there are:
+        adjacent entries with the same next hop and attributes
+
+        This function specifically loops though the forwarding tables getting adjacent entries,
+        then passes off the adjacent entries to a helper 'adjacent aggregation'
+        """
+        adjacent_ips = []
+        # loop through forwarding table
+        for network, entries in self.forwarding_table.items():
+            for entry in entries:
+                # add current entry to adjacent buffer
+                adjacent_ips = [(network, entry)]
+                netmask = entry["netmask"]
+                octet = network.split('.')[-1]
+
+                # within the inital loop, loop through all forwarding table entries to see if
+                # there is anything adjacent to the outer loop entry
+                for sub_network, sub_entries in self.forwarding_table.items():
+                    for sub_entry in sub_entries:
+                        # if inner entry = outer entry keep going
+                        if network == sub_network:
+                            continue
+                        current_netmask = sub_entry['netmask']
+                        # if they have the same netmask, check if they are adjacent
+                        if netmask == current_netmask:
+                            cur_netmask = "".join(["{:08b}".format(int(x)) for x in current_netmask.split(".")])
+                            main_network = "".join(["{:08b}".format(int(x)) for x in network.split(".")])
+                            cur_network = "".join(["{:08b}".format(int(x)) for x in sub_network.split(".")])
+                            ones = cur_netmask.count("1")
+
+                            if cur_network[:ones - 1] == main_network[:ones - 1]:
+                                # if they are adjacent, add it to list
+                                adjacent_ips.append((sub_network, sub_entry))
+
+            # if the adjacent ips list has at least 2 adjacent ips, aggregate
+            if len(adjacent_ips) > 1:
+                self.adjacent_aggregation(adjacent_ips)
+                return
+
+    def adjacent_aggregation(self, adjacent_ips):
+        """
+        Next step in the aggregation process checks to see if the adjacent entries have
+        the same next hop and attributes. If so, passes it on to the 'final_aggregation'
+        helper that propogates changes to forwarding table
+
+        takes in a list of adjacent entries in form of a tuple: (ip, entry)
+        """
+
+        # buffer used to make sure aggregation does not happen twice
+        # i.e (ip1, ip2) and (ip2, ip1) don't both get aggregated
+        already_aggregated = []
+
+        # buffer used for the list of ip tuples
+        aggregate_list = []
+        
+        # loop through each (ip, entry) tuple in adjacent list
+        for ip_tuple in adjacent_ips:
+
+            # if the entry does not exist or has already been marked to be aggregated, keep going 
+            if not self.forwarding_table[ip_tuple[0]]:
+                continue
+            if ip_tuple in aggregate_list or ip_tuple[0] in already_aggregated:
+                continue
+
+            # O.W. add the current ip tuple to the aggregate list
+            aggregate_list.append(ip_tuple)
+
+            # sub-loop to go through each adjacent IP checking if they have the same attributes
+            for sub_tuple in adjacent_ips:
+                # if the sub tuple is the outer tuple, keep going
+                if ip_tuple[0] == sub_tuple[0]:
+                    continue
+                if (ip_tuple[1]['peer'] == sub_tuple[1]['peer'] and
+                        ip_tuple[1]['localpref'] == sub_tuple[1]['localpref'] and
+                        ip_tuple[1]['ASPath'] == sub_tuple[1]['ASPath'] and
+                        ip_tuple[1]['selfOrigin'] == sub_tuple[1]['selfOrigin'] and
+                        ip_tuple[1]['origin'] == sub_tuple[1]['origin']):
+                    # same attributes = aggregate the ips
+                    aggregate_list.append(sub_tuple)
+        
+        # if there are at least 2 that need to be aggregated:
+        #   add to already_aggregated list and then pass to final_aggregate helper
+        if len(aggregate_list) > 1:
+            for ip_tup in aggregate_list:
+                already_aggregated.append(ip_tup[0])
+            self.final_aggregate(aggregate_list)
+
+    def final_aggregate(self, entries):
+        """
+        final function that deals with aggregation. Given a list of ip tuples (ip, entry)
+        that all need to be aggregated makes the appropriate changes to the forwarding table.
+
+        takes in the entries to be aggregated.
+        """
+
+        # gets the lowest ip in the list
+        lowest_ip = float('inf')
+        for entry in entries:
+            if self.IPtoInt(entry[0]) < lowest_ip:
+                lowest_ip = self.IPtoInt(entry[0])
+        lowest_ip = socket.inet_ntoa(struct.pack('!L', lowest_ip))
+
+        # gets a list of all entries that are NOT the lowest ip
+        ip_list = [ip for ip in entries if ip[0] != lowest_ip]
+
+        # gets the entry associated with the lowest ip
+        lowest_entry = [ip for ip in entries if ip[0] == lowest_ip]
+        
+        # for each entry in the list of all ip entries  minus the lowest, remove the entry from the table
+        # a.k.a if the entry was {192.168.1.2 : [entry1]} -> {192.168.1.2 : []}
+        for ip, entry in ip_list:
+            if ip in self.forwarding_table and entry in self.forwarding_table[ip]:
+                self.forwarding_table[ip].remove(entry)
+        
+        # iterate through the forwarding table finding the lowest_ip entry
+        # and reducing the netmask for that entry by 1 (aggregating)
+        for network, entries in self.forwarding_table.items():
+            index = 0
+            for entry in entries:
+                if entry == lowest_entry[0][1] and network == lowest_ip:
+                    netmask = self.forwarding_table[lowest_ip][index]['netmask']
+                    new_netmask = self.decrease_netmask(netmask)
+                    self.forwarding_table[lowest_ip][index]['netmask'] = new_netmask
+                else:
+                    index = index + 1
+
+    def decrease_netmask(self, netmask):
+        """
+        Function that takes in a netmask and reduces it by 1
+        Used to aggregate the table.
+        """
+
+        # Convert the netmask to binary representation
+        netmask_binary = "".join(["{:08b}".format(int(x)) for x in netmask.split(".")])
+        
+        # Find the index of the last "1" bit in the binary representation
+        last_one_index = netmask_binary.rfind("1")
+        
+        # Decrease the netmask by flipping the bit at the index of the last "1" bit
+        decreased_netmask_binary = netmask_binary[:last_one_index] + "0" + netmask_binary[last_one_index + 1:]
+        
+        # Convert the decreased netmask back to dotted-decimal notation
+        decreased_netmask = ".".join([str(int(decreased_netmask_binary[i:i+8], 2)) for i in range(0, 32, 8)])
+        return decreased_netmask
+
+
+    def IPtoInt(self, IP):
+        """
+        Converts given IP in string notation to an integer
+        """
+        IP_split = IP.split('.')
+        return int(IP_split[0]) << 24 | int(IP_split[1]) << 16 | int(IP_split[2]) << 8 | int(IP_split[3])
+
+
+    def send_updates(self, message, srcif):
+        """
+        Sends update message to the neighbors that need it
+
+        takes in the update message and the src interface that sent it
+        """
+
+        # computes the new AS path by combining my AS to the given AS Path
+        ASPath = [self.asn] + message.get("ASPath")
+
+        # construct the message to send
+        msg = { "netmask": message.get("netmask"), "ASPath": ASPath, "network": message.get("network") }
+        
+        # if the src that sent it is a customer, send it to everyon
+        if self.relations[srcif] == "cust":
+            for neighbor, relation in self.relations.items():
+                if neighbor != srcif:
+                    self.send(neighbor, 
+                            json.dumps({ "msg": msg, "src": self.our_addr(neighbor), "dst": neighbor, "type": "update"}))
+        else:
+            # O.W. send it to all customers
+            for neighbor, relation in self.relations.items():
+                if neighbor != srcif and relation == "cust":
+                    self.send(neighbor, 
+                            json.dumps({ "msg": msg, "src": self.our_addr(neighbor), "dst": neighbor, "type": "update"}))
+
+
+    def add_to_forwarding(self, message, srcif):
+        """
+        Given the update message (json loaded) and the src interface that sent it,
+        add the given updates to our forwarding table
+        """
+
+        # get the network provided by the update msg
+        network = message.get("network")
+        
+        # remember, forwarding_table is {network: [entries]} so if the given network
+        # isn't already a key, make it one
+        if network not in self.forwarding_table:
+            self.forwarding_table[network] = []
+
+        # Create a new entry in the forwarding table
+        self.forwarding_table[network].append({
+            'netmask': message.get("netmask"),
+            'peer': srcif,
+            'localpref': message.get("localpref"),
+            'ASPath': message.get("ASPath"),
+            'selfOrigin': message.get("selfOrigin"),
+            'origin': message.get("origin")
+        })
+
+    def data(self, message, srcif):
+        """
+        Function to deal with 'data' messages received from the server.
+        Calls for helpers to try to find entries in the forwarding table that correspond to where to send
+        the packet.
+
+        Then if a match is found and the relationship is good, send the packet. O.W. send a 'no route'
+        """
+
+        src = message.get("src")
+        dst = message.get("dst")
+        msg = message.get("msg")
+
+        # helper that returns an array of possible routes to the destination network, or None if none is found
+        table_match = self.tableMatch(dst)       
+        if table_match is None:
+            self.send(srcif, json.dumps({"src": self.our_addr(srcif), "dst": src, "type": "no route", "msg": {}}))
+            return
+        elif len(table_match) == 1:
+            # if there is one match, that is the entry you send it to
+            sending_addr = self.forwarding_table[table_match[0]][0]
+        else:
+            # if there is more than one match, you call to helper 'pick_best' that picks the best one
+            # given the tieBreaking conditions in the assignment page
+            sending_addr = self.pick_best(table_match)
+
+        # if ANY of the relations (src of msg, dst of msg, src interface, peer we are sending to) are customers
+        # send it. O.W. send a 'no route'
+        if (self.relations.get(src, "") != "cust" and
+            self.relations.get(dst, "") != "cust" and
+            self.relations.get(srcif, "") != "cust" and
+            self.relations.get(sending_addr['peer'], "") != "cust"):
+            
+            self.send(srcif, json.dumps({"src": self.our_addr(srcif), "dst": src, "type": "no route", "msg": {}}))
+        else:
+            self.send(sending_addr['peer'], json.dumps({"src": self.our_addr(dst), "dst": dst, "type": "data", "msg": msg}))
+
+    def pick_best(self, matches):
+        """
+        Function that, given all the networks that match, picks the best one
+        based on tiebreaking rules
+        """
+
+        # Check for highest prefix first
+        longest_prefix = 0
+        longest_matches = []
+        # iterates through matches finding the longest netmask
+        for entries in matches:
+            for entry in self.forwarding_table[entries]:
+                netmask = entry['netmask']
+                netmask_binary = self.IPtoBinaryString(netmask)
+                prefix_length = netmask_binary.count('1')
+                if prefix_length > longest_prefix:
+                    longest_prefix = prefix_length
+                    longest_matches = [entry]
+                elif prefix_length == longest_prefix:
+                    longest_matches.append(entry)
+
+        # if there is more than one with the longest netmask, tie-break
+        # O.W. you found it and return
+        if len(longest_matches) > 1:
+            return self.tieBreaker(longest_matches)
+        else:
+            return longest_matches[0]
+
+    def tieBreaker(self, matches):
+        """
+        Function used to break the tie between matches with the same length netmask
+
+        Based on the following:
+        The entry with the highest localpref wins. If the localprefs are equal…
+        The entry with selfOrigin as true wins. If all selfOrigins are the equal…
+        The entry with the shortest ASPath wins. If multiple entries have the shortest length…
+        The entry with the best origin wins, where IGP > EGP > UNK. If multiple entries have the best origin…
+        The entry from the neighbor router (i.e., the src of the update message) with the lowest IP address.
+        """
+
+        # gets the highest localpref
+        local_prefs = []
+        for entry in matches:
+            # makes a list of tuple (entry, localpref)
+            local_prefs.append((entry, entry['localpref']))
+        sorted_local_prefs = sorted(local_prefs, key=lambda x: x[1])
+        highest_local_pref = sorted_local_prefs[-1][1]
+        
+        # filters local_pref list for ones = highest localpref
+        filtered_local_prefs = [tup for tup in sorted_local_prefs if tup[1] == highest_local_pref]
+        if len(filtered_local_prefs) == 1:
+            # if there is only 1 in the filtered list, you found it
+            return filtered_local_prefs[0][0]
+
+        # filter the 'highest localpref' list by ones with selfOrigin = true
+        filtered_selfOrigin = [tup for tup in filtered_local_prefs if tup[0]['selfOrigin']]
+        if len(filtered_selfOrigin) == 1:
+            # if there is only 1, you found it
+            return filtered_selfOrigin[0][0]
+        elif len(filtered_selfOrigin) == 0:
+            # if there is 0 that means none had selfOrigin = true, so use the original list
+            filtered_selfOrigin = filtered_local_prefs
+
+        # look for shortest path length then filter based on ones = to lowest path length
+        shortest_path_length = min([tup[0]['ASPath'] for tup in filtered_selfOrigin], key=len)
+        filtered_shortest_path = [tup for tup in filtered_selfOrigin if len(tup[0]['ASPath']) == len(shortest_path_length)]
+        if len(filtered_shortest_path) == 1:
+            # if there is only 1, you found it
+            return filtered_shortest_path[0][0]
+
+        # sort origin values based on the weight of each value
+        origin_values = {'UNK': 3, 'EGP': 2, 'IGP': 1}
+        sorted_origins = sorted(filtered_shortest_path, key=lambda tup: origin_values[tup[0]['origin']])
+        # filter origins by the highest origin found in the sorted list
+        filtered_origins = [tup for tup in sorted_origins if tup[0]['origin'] == sorted_origins[0][0]['origin']] 
+        
+        if len(filtered_origins) == 1:
+            # if only 1 with the highest origin, you found it
+            return filtered_origins[0][0]
+        elif len(filtered_origins) == 0:
+            # if none found, that means they are all the same origin, keep going
+            filtered_origins = sorted_origins
+        
+        # find the lowest ip out of remaining list, return that entry
+        lowest_ip = float('inf')
+        best_entry = None
+        for entry in filtered_origins:
+            binaryIP = self.IPtoBinaryString(entry[0]['peer'])
+            IP_value = int(binaryIP, 2)
+            if IP_value < lowest_ip:
+                best_entry = entry
+                lowest_ip = IP_value
+        return best_entry[0]
+
+
+    def IPtoBinaryString(self, number):
+        """
+        Function that turns IPs in octal form to binary
+        """
+        number_split = number.split('.')
+        return ''.join([bin(int(x))[2:].zfill(8) for x in number_split])
+
+    def tableMatch(self, ip):
+        """
+        Function that returns matching entries in the forwarding table for the given ip
+        """
+        matching_entries = []
+        for network, entries in self.forwarding_table.items():
+            for entry in entries:
+                # gets the netmask of the current entry
+                netmask = entry.get('netmask')
+                
+                # converts netmask, ip, and current_iterated networkIP to binary
+                netmask_binary = self.IPtoBinaryString(netmask) 
+                ip_binary = self.IPtoBinaryString(ip)
+                network_binary = self.IPtoBinaryString(network)
+           
+                # checks to see if the current_iterated networkIP and the given ip are the same,
+                # up til the netmask
+                network_prefix_length = netmask_binary.count('1')
+                if ip_binary[:network_prefix_length] == network_binary[:network_prefix_length]:
+                    matching_entries.append(network)
+        
+        # if no matching entries, return None. O.W. return the list of matching entries
+        if len(matching_entries) == 0:
+            return None
+        else:
+            return matching_entries
+
+if __name__ == "__main__":
+    """
+    main function provided by starter code;
+    parses command line args and starts up router
+    """
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
